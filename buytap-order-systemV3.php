@@ -1768,26 +1768,25 @@ add_shortcode('buytap_pending_orders', function () {
                                 $seller_user_id = (int) get_post_field('post_author', $seller_id);
                                 $seller_name = get_the_author_meta('display_name', $seller_user_id);
                                 $seller_number = get_user_meta($seller_user_id, 'mobile_number', true);
-                                $pair_time    = (int) $chunk->pair_time;
-								$chunk_status = (string) $chunk->status;
-
-								// ✅ FIX: If pair_time is zero or missing, set it to now and persist it
-								// so the buyer always gets a fresh 1-hour payment window
-								if ($pair_time <= 0) {
-									$pair_time = current_time('timestamp', true);
-									global $wpdb;
-									$wpdb->update(
-										buytap_chunks_table(),
-										['pair_time' => $pair_time],
-										['id'        => (int) $chunk->id]
-									);
-								}
+                                $pair_time = (int) $chunk->pair_time;
+                                $chunk_status = (string) $chunk->status;
                             ?>
                             <tr>
                               <td><?= esc_html($seller_name) ?></td>
                               <td><?= esc_html($seller_number) ?></td>
                               <td>Ksh. <?= number_format((float)$chunk->amount) ?></td>
-                              <td data-countdown="<?= esc_attr($pair_time + 3600) ?>">Loading...</td>
+                              <?php
+								if ($pair_time <= 0) {
+									$pair_time = time();
+									global $wpdb;
+									$wpdb->update(
+										buytap_chunks_table(),
+										['pair_time' => $pair_time],
+										['id' => (int) $chunk->id]
+									);
+								}
+								?>
+								<td data-countdown="<?= esc_attr($pair_time + 3600) ?>">Loading...</td>
                               <td>
                                 <?php if ($chunk_status === 'Received'): ?>
                                     <span class="badge-paid">✔ Received</span>
@@ -1930,13 +1929,10 @@ add_action('wp_footer', function () {
             }
 
             const raw = parseInt(cell.dataset.countdown, 10); // expiry in UTC seconds
-
-			// ✅ FIX: A valid Unix expiry timestamp must be > 1 billion (year ~2001+).
-			// Values like 3600 mean pair_time was 0 in the DB — treat as invalid.
-			if (!raw || raw < 1000000000) { 
-				cell.textContent = '--'; 
-				return; 
-			}
+            if (!raw) { 
+                cell.textContent = '--'; 
+                return; 
+            }
 
             const endTime = raw * 1000; // convert to ms
 
@@ -2672,43 +2668,32 @@ function buytap_perform_pairing($buyer_order_id, $seller_order_id, $initiator) {
     if ($chunk_amount <= 0) return false;
 
     // Optional pre-check to avoid duplicate pairs (still handle rollback below)
-	$existing_chunk = $wpdb->get_row($wpdb->prepare(
-		"SELECT id, pair_time FROM $table_name
-		 WHERE buyer_order_id = %d AND seller_order_id = %d
-		   AND status IN ('Awaiting Payment','Payment Made')
-		 LIMIT 1",
-		$buyer_order_id, $seller_order_id
-	));
+    $existing = (int) $wpdb->get_var($wpdb->prepare(
+        "SELECT COUNT(*) FROM $table_name
+         WHERE buyer_order_id = %d AND seller_order_id = %d
+           AND status IN ('Awaiting Payment','Payment Made')",
+        $buyer_order_id, $seller_order_id
+    ));
+    if ($existing > 0) {
+        // give back reserved amount and skip
+        buytap_atomic_give_back_to_seller($seller_order_id, $chunk_amount);
+        return false;
+    }
 
-	if ($existing_chunk) {
-		// ✅ FIX: If pair_time is zero (schema migration / old data), refresh it now
-		// so the buyer gets a valid 1-hour countdown window
-		if ((int) $existing_chunk->pair_time <= 0) {
-			$wpdb->update(
-				$table_name,
-				['pair_time' => current_time('timestamp', true)],
-				['id'        => (int) $existing_chunk->id]
-			);
-		}
-		// give back reserved amount and skip inserting a duplicate
-		buytap_atomic_give_back_to_seller($seller_order_id, $chunk_amount);
-		return false;
-	}
+    // Create chunk with the reserved amount
+    $ok = $wpdb->insert($table_name, [
+        'buyer_order_id' => $buyer_order_id,
+        'seller_order_id'=> $seller_order_id,
+        'amount'         => $chunk_amount,
+        'status'         => 'Awaiting Payment',
+        'pair_time'      => time(),
+    ]);
 
-		// Create chunk with the reserved amount
-		$ok = $wpdb->insert($table_name, [
-			'buyer_order_id' => $buyer_order_id,
-			'seller_order_id'=> $seller_order_id,
-			'amount'         => $chunk_amount,
-			'status'         => 'Awaiting Payment',
-			'pair_time'      => current_time('timestamp', true),
-		]);
-
-		if ($ok === false) {
-			// Roll back the reservation if insert failed (e.g., unique key race)
-			buytap_atomic_give_back_to_seller($seller_order_id, $chunk_amount);
-			return false;
-		}
+    if ($ok === false) {
+        // Roll back the reservation if insert failed (e.g., unique key race)
+        buytap_atomic_give_back_to_seller($seller_order_id, $chunk_amount);
+        return false;
+    }
 
     // Sync buyer & seller metas
     update_post_meta($buyer_order_id,  'remaining_to_send',    max(0, buytap_buyer_remaining($buyer_order_id)));
@@ -2716,7 +2701,7 @@ function buytap_perform_pairing($buyer_order_id, $seller_order_id, $initiator) {
     update_post_meta($seller_order_id, 'remaining_to_receive', $seller_counter);
 
     // Stamp buyer pair time for countdown
-    update_post_meta($buyer_order_id, 'pair_time', current_time('timestamp', true));
+    update_post_meta($buyer_order_id, 'pair_time', time());
 
     // If buyer fully matched now, set paired status
     if (buytap_buyer_remaining($buyer_order_id) <= 0) {
@@ -3735,4 +3720,3 @@ add_action('wp_footer', function() {
     </script>
     <?php
 });
-
